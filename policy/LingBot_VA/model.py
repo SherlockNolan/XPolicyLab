@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 _CUR_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _CUR_DIR.parents[3]
+_REPO_ROOT = _CUR_DIR.parents[2]
 
 for _path in (str(_REPO_ROOT),):
     if _path not in sys.path:
@@ -14,7 +14,6 @@ for _path in (str(_REPO_ROOT),):
 
 from XPolicyLab.model_template import ModelTemplate
 from XPolicyLab.utils.process_data import (
-    decode_image_bit,
     get_robot_action_dim_info,
     pack_robot_state,
     unpack_robot_state,
@@ -52,12 +51,8 @@ def extract_image(observation, candidate_names):
 
 
 def ensure_hwc_uint8(image):
-    if isinstance(image, (bytes, bytearray, memoryview)):
-        image = decode_image_bit(np.frombuffer(bytes(image), dtype=np.uint8))
 
     image = np.asarray(image)
-    if image.ndim == 1 and image.dtype == np.uint8:
-        image = decode_image_bit(image)
 
     if image.ndim != 3:
         raise ValueError(f"Expected image ndim=3, got shape {image.shape}")
@@ -435,32 +430,12 @@ class Model(ModelTemplate):
         )
 
     def get_action_batch(self, env_idx_list=None, **kwargs):
-        if self.observation_window is None:
-            raise AssertionError("update_obs or update_obs_batch first!")
-
-        if self.rollout_mode == "receding_horizon":
-            self._soft_reset_inference_state()
-            action_chunk = self._predict_chunk(self.observation_window[0])
-        else:
-            if self._first_observation is None:
-                self._reset_server_with_instruction(self.observation_window[0])
-                self._first_observation = self.observation_window[0]
-            else:
-                self._commit_executed_frames()
-            action_chunk = self._predict_chunk(self._first_observation)
-
-        env_idx_list = env_idx_list or self._latest_env_idx_list
-
-        if self.robot_action_dim_info is None:
-            return [action_chunk for _ in env_idx_list]
-
-        unpacked = unpack_robot_state(
-            action_chunk,
-            self.action_type,
-            self.robot_action_dim_info,
-            source_type="obs",
+        # Required ModelTemplate hook. The previous implementation inferred env0
+        # once and copied that chunk to every env; do not restore that behavior.
+        raise NotImplementedError(
+            "LingBot_VA wan_va_server keeps one global KV/VAE cache and cannot "
+            "evaluate multiple envs in one process. Keep eval_batch: false in deploy.yml."
         )
-        return [unpacked for _ in env_idx_list]
 
     def get_action_per_frame(self):
         return self.action_per_frame

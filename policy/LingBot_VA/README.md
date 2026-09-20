@@ -16,7 +16,7 @@ conda activate <policy_env>  # e.g. lingbot_va
 
 ## Data Processing
 
-`process_data.sh` takes a standard RoboDojo LeRobot **v2.1** dataset (parquet + per-camera mp4) and runs every upstream step to produce a training-ready latent dataset: it maps actions into the 30-dim layout — left/right arm EEF (7+7), left/right arm joints (7+7), left/right gripper (1+1), with missing dimensions zero-padded — adds an `action_config` segment to each `meta/episodes.jsonl` line, encodes Wan2.2 VAE video latents into a `latents/` tree (videos resized to ~256×256 and downsampled to 5–15 fps, matching `va_robotwin30_train_cfg`), and writes `empty_emb.pt` (the Wan2.2 text embedding of an empty string, used when classifier-free guidance drops language conditioning) at the dataset root. The base model supplies the VAE and text encoder, so `LINGBOT_VA_BASE_MODEL_PATH` must be set.
+`process_data.sh` takes a standard RoboDojo LeRobot **v2.1** dataset (parquet + per-camera mp4, in the keys of `XPolicyLab/scripts/transform_lerobot_v21_format.py` — [Official LeRobot conversion](../../README.md#official-lerobot-conversion)) and runs every upstream step to produce a training-ready latent dataset: it maps actions into the 30-dim layout — left/right arm EEF (7+7), left/right arm joints (7+7), left/right gripper (1+1), with missing dimensions zero-padded — adds an `action_config` segment to each `meta/episodes.jsonl` line, encodes Wan2.2 VAE video latents into a `latents/` tree (videos resized to ~256×256 and downsampled to 5–15 fps, matching `va_robotwin30_train_cfg`), and writes `empty_emb.pt` (the Wan2.2 text embedding of an empty string, used when classifier-free guidance drops language conditioning) at the dataset root. The base model supplies the VAE and text encoder, so `LINGBOT_VA_BASE_MODEL_PATH` must be set.
 
 ```bash
 cd XPolicyLab/policy/LingBot_VA
@@ -65,6 +65,8 @@ bash eval.sh RoboDojo stack_bowls RoboDojo-cotrain-arx_x5-joint-0 arx_x5 joint 0
 ```
 
 `EVAL_ENV_TYPE=debug` runs the offline wiring check (no simulator); leave it unset or set `EVAL_ENV_TYPE=sim` for RoboDojo simulation. For split-machine deployment via `setup_eval_policy_server.sh` / `setup_eval_env_client.sh`, follow the [Deployment Flow](../../README.md#-deployment-flow).
+
+`eval_batch` is `false` and must stay that way: `wan_va_server` keeps one global KV/VAE/`frame_st_id` cache, so one process can serve only one env. `get_action_batch` raises `NotImplementedError`.
 
 ## Configuration
 
