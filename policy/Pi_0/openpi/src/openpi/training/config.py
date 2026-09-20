@@ -265,6 +265,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             ]
         )
     )
+
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
@@ -289,6 +290,34 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TpecYamDataConfig(DataConfigFactory):
+    """Native YAM/TPEC data contract used by the deployed pi0 checkpoints."""
+
+    task: str = "TASK-YAM-0004"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            # The model adapter emits canonical keys; no dataset repack is
+            # needed for inference.
+            repack_transforms=_transforms.Group(),
+            data_transforms=_transforms.Group(
+                inputs=[
+                    aloha_policy.AlohaInputs(adapt_to_pi=False),
+                    _transforms.DeltaActions(delta_action_mask),
+                ],
+                outputs=[
+                    _transforms.AbsoluteActions(delta_action_mask),
+                    aloha_policy.AlohaOutputs(adapt_to_pi=False),
+                ],
+            ),
+            model_transforms=ModelTransformFactory()(model_config),
         )
 
 
@@ -577,6 +606,15 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    # TPEC YAM pi0 checkpoints are trained with the native three-camera,
+    # 14-dimensional YAM contract (action horizon 50, padded model dim 32).
+    TrainConfig(
+        name="tpec_pi0_yam",
+        model=pi0_config.Pi0Config(action_horizon=50, action_dim=32, dtype="bfloat16", pi05=False),
+        data=TpecYamDataConfig(repo_id="yam/teleop", task="TASK-YAM-0004"),
+        wandb_enabled=False,
+        policy_metadata={"robot": "yam", "action_horizon": 50, "action_dim": 14, "adapt_to_pi": False},
+    ),
     TrainConfig(
         name="pi0_base_aloha_full_sim_arx-x5_seed_0",
         model=pi0_config.Pi0Config(),
