@@ -1,27 +1,34 @@
-#!/usr/bin/env python
 # -- coding: UTF-8
 """
-#!/usr/bin/python3
+Pi0/Pi0.5 policy adapter for XPolicyLab.
 """
+import dataclasses
 from pathlib import Path
-import os
-import sys
 from typing import Any
 
 import numpy as np
-
 from openpi.policies import policy_config as _policy_config
 from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 
 from XPolicyLab.model_template import ModelTemplate
+from XPolicyLab.policy.Pi_0.yam_layout import (
+    ARMS_THEN_GRIPPERS,
+    BOUNDED_SLEW_ACTION_OVERRIDE,
+    GROUPED_TRAIN_ACTION_REPRESENTATION,
+    GROUPED_TRAIN_DELTA_MASK,
+    INTERLEAVED,
+    TRAINED_14D_ACTION_NOISE_MASK,
+    bound_hardware_action_slew,
+    to_hardware_layout,
+    to_training_layout,
+)
 from XPolicyLab.utils.checkpoint_resolver import candidate_checkpoint_roots
 from XPolicyLab.utils.process_data import (
     get_robot_action_dim_info,
     pack_robot_state,
     unpack_robot_state,
 )
-
 
 _POLICY_DIR = Path(__file__).resolve().parent
 _CHECKPOINTS_DIR = _POLICY_DIR / "checkpoints"
@@ -90,9 +97,51 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg: dict[str, Any]):
         self.task_name = model_cfg["task_name"]
         self.action_type = model_cfg.get("action_type", "joint")
+        self.state_action_layout = model_cfg.get("state_action_layout", INTERLEAVED)
+        if self.state_action_layout not in {INTERLEAVED, ARMS_THEN_GRIPPERS}:
+            raise ValueError(f"unsupported state_action_layout: {self.state_action_layout!r}")
+        self.train_config_name = model_cfg.get("train_config_name")
+        self.action_representation = model_cfg.get("action_representation")
+        self.action_override = model_cfg.get("action_override")
+        self.action_override_arm_step = model_cfg.get("action_override_arm_step")
+        self.action_override_gripper_step = model_cfg.get("action_override_gripper_step")
+        self.action_noise_mask = model_cfg.get("action_noise_mask")
+        if str(self.train_config_name).startswith("yam_dual_") and self.state_action_layout != ARMS_THEN_GRIPPERS:
+            raise ValueError("dual YAM checkpoints require state_action_layout=arms_then_grippers")
+        expected_representation = (
+            "absolute_joint_positions"
+            if self.train_config_name == "yam_dual_task004_pi0_absolute"
+            else GROUPED_TRAIN_ACTION_REPRESENTATION
+        )
+        if str(self.train_config_name).startswith("yam_dual_") and self.action_representation != expected_representation:
+            raise ValueError(f"{self.train_config_name} requires action_representation={expected_representation}")
+        if self.action_override is not None:
+            if self.action_override != BOUNDED_SLEW_ACTION_OVERRIDE:
+                raise ValueError(f"unsupported action_override: {self.action_override!r}")
+            if self.action_representation != GROUPED_TRAIN_ACTION_REPRESENTATION:
+                raise ValueError("bounded_slew_v1 requires the grouped training delta representation")
+            if self.train_config_name != "yam_dual_task004_pi05_relative":
+                raise ValueError("bounded_slew_v1 is currently supported only for TASK-YAM-0004 dual Pi0.5")
+            for name, maximum in (("action_override_arm_step", 0.02), ("action_override_gripper_step", 0.10)):
+                value = model_cfg.get(name)
+                if type(value) not in (int, float) or not np.isfinite(value) or not 0 < value <= maximum:
+                    raise ValueError(f"{name} must be finite and in (0, {maximum}]")
+        elif self.action_override_arm_step is not None or self.action_override_gripper_step is not None:
+            raise ValueError("action override step limits require action_override")
+        if self.action_noise_mask is not None:
+            if self.action_noise_mask != TRAINED_14D_ACTION_NOISE_MASK:
+                raise ValueError(f"unsupported action_noise_mask: {self.action_noise_mask!r}")
+            if self.train_config_name != "yam_dual_task004_pi05_relative":
+                raise ValueError("valid_14_zero_pad_v1 is currently supported only for TASK-YAM-0004 dual Pi0.5")
+            if self.action_representation != GROUPED_TRAIN_ACTION_REPRESENTATION:
+                raise ValueError("valid_14_zero_pad_v1 requires the grouped training delta representation")
+        if self.train_config_name == "tpec_pi0_yam" and self.state_action_layout != INTERLEAVED:
+            raise ValueError("seed25 YAM checkpoints require state_action_layout=interleaved")
         self.robot_action_dim_info = (
             get_robot_action_dim_info(model_cfg["env_cfg_type"]) if model_cfg.get("env_cfg_type") is not None else None
         )
+        if self.state_action_layout == ARMS_THEN_GRIPPERS and self.robot_action_dim_info is not None:
+            raise ValueError("arms_then_grippers requires direct 14-vector YAM observations (env_cfg_type=None)")
         self.observation_window: dict[str, Any] | None = None
         self._latest_env_idx_list: list[int] = [0]
 
@@ -103,13 +152,38 @@ class Model(ModelTemplate):
         train_config_name = model_cfg.get("train_config_name")
         repo_id = model_cfg.get("repo_id", "1118")
         model_root = _resolve_pi_model_root(model_cfg)
+        self.checkpoint_path = str(model_root.resolve())
 
         config = _config.get_config(train_config_name)
+        if self.action_representation == GROUPED_TRAIN_ACTION_REPRESENTATION:
+            config = dataclasses.replace(
+                config,
+                data=dataclasses.replace(
+                    config.data,
+                    delta_action_mask_override=GROUPED_TRAIN_DELTA_MASK,
+                ),
+            )
         norm_stats = None
         if repo_id is not None:
             norm_stats = _normalize.load(model_root / "assets" / str(repo_id))
 
-        return _policy_config.create_trained_policy(config, str(model_root), norm_stats=norm_stats)
+        kwargs = {"norm_stats": norm_stats}
+        if getattr(self, "action_noise_mask", None) == TRAINED_14D_ACTION_NOISE_MASK:
+            kwargs["sample_kwargs"] = {"valid_action_dim": 14}
+        return _policy_config.create_trained_policy(config, str(model_root), **kwargs)
+
+    def get_deployment_info(self):
+        """Read-only identity used to reject stale servers before robot motion."""
+        return {
+            "checkpoint": self.checkpoint_path,
+            "train_config_name": self.train_config_name,
+            "state_action_layout": self.state_action_layout,
+            "action_representation": self.action_representation,
+            "action_override": self.action_override,
+            "action_override_arm_step": self.action_override_arm_step,
+            "action_override_gripper_step": self.action_override_gripper_step,
+            "action_noise_mask": self.action_noise_mask,
+        }
 
     def update_obs(self, obs):
         self.update_obs_batch([obs])
@@ -119,6 +193,9 @@ class Model(ModelTemplate):
         encoded_obs_list = [
             encode_obs(obs, self.action_type, self.robot_action_dim_info) for obs in obs_list
         ]
+        if self.state_action_layout == ARMS_THEN_GRIPPERS:
+            for encoded in encoded_obs_list:
+                encoded["state"] = to_training_layout(encoded["state"])
         self.observation_window = stack_obs(encoded_obs_list)
 
     def get_action(self, **kwargs):
@@ -136,6 +213,15 @@ class Model(ModelTemplate):
         for batch_index, _ in enumerate(env_idx_list):
             single_observation = slice_stacked_obs(self.observation_window, batch_index)
             actions = self.policy.infer(single_observation, **kwargs)["actions"]
+            if self.state_action_layout == ARMS_THEN_GRIPPERS:
+                actions = to_hardware_layout(actions)
+            if getattr(self, "action_override", None) == BOUNDED_SLEW_ACTION_OVERRIDE:
+                actions = bound_hardware_action_slew(
+                    actions,
+                    to_hardware_layout(single_observation["state"]),
+                    arm_step=self.action_override_arm_step,
+                    gripper_step=self.action_override_gripper_step,
+                )
             if self.robot_action_dim_info is None:
                 action_list.append(actions)
             else:

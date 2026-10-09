@@ -206,7 +206,7 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        (_prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -221,6 +221,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        valid_action_dim: int | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -229,6 +230,14 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        # Some RLDS checkpoints were trained with an action mask: both the
+        # targets and diffusion noise were zero outside the physical action
+        # dimensions. Keep those dimensions zero throughout sampling too.
+        # This is opt-in so unrelated checkpoints retain their original path.
+        valid_action_mask = None
+        if valid_action_dim is not None:
+            valid_action_mask = jnp.arange(self.action_dim) < valid_action_dim
+            noise = jnp.where(valid_action_mask, noise, 0.0)
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -268,10 +277,13 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            next_x = x_t + dt * v_t
+            if valid_action_mask is not None:
+                next_x = jnp.where(valid_action_mask, next_x, 0.0)
+            return next_x, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _x_t, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 

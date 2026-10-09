@@ -298,25 +298,39 @@ class TpecYamDataConfig(DataConfigFactory):
     """Native YAM/TPEC data contract used by the deployed pi0 checkpoints."""
 
     task: str = "TASK-YAM-0004"
+    use_delta_joint_actions: bool = True
+    # The dual RLDS fine-tunes normalize both state and action with q01/q99,
+    # including their pi0 variants. Leave seed25's existing behavior intact.
+    quantile_norm_override: bool | None = None
+    # Deployment may pin the exact mask stored in a grouped RLDS checkpoint.
+    # The default preserves existing seed25 and training configurations.
+    delta_action_mask_override: tuple[bool, ...] | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        inputs = [aloha_policy.AlohaInputs(adapt_to_pi=False)]
+        outputs = [aloha_policy.AlohaOutputs(adapt_to_pi=False)]
+        if self.use_delta_joint_actions:
+            delta_action_mask = (
+                self.delta_action_mask_override
+                if self.delta_action_mask_override is not None
+                else _transforms.make_bool_mask(6, -1, 6, -1)
+            )
+            if len(delta_action_mask) != 14 or any(type(value) is not bool for value in delta_action_mask):
+                raise ValueError("YAM delta action mask must contain exactly 14 booleans")
+            inputs.append(_transforms.DeltaActions(delta_action_mask))
+            outputs.insert(0, _transforms.AbsoluteActions(delta_action_mask))
+        elif self.delta_action_mask_override is not None:
+            raise ValueError("absolute YAM actions cannot use a delta action mask override")
+        base_config = self.create_base_config(assets_dirs, model_config)
+        if self.quantile_norm_override is not None:
+            base_config = dataclasses.replace(base_config, use_quantile_norm=self.quantile_norm_override)
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             # The model adapter emits canonical keys; no dataset repack is
             # needed for inference.
             repack_transforms=_transforms.Group(),
-            data_transforms=_transforms.Group(
-                inputs=[
-                    aloha_policy.AlohaInputs(adapt_to_pi=False),
-                    _transforms.DeltaActions(delta_action_mask),
-                ],
-                outputs=[
-                    _transforms.AbsoluteActions(delta_action_mask),
-                    aloha_policy.AlohaOutputs(adapt_to_pi=False),
-                ],
-            ),
+            data_transforms=_transforms.Group(inputs=inputs, outputs=outputs),
             model_transforms=ModelTransformFactory()(model_config),
         )
 
@@ -614,6 +628,41 @@ _CONFIGS = [
         data=TpecYamDataConfig(repo_id="yam/teleop", task="TASK-YAM-0004"),
         wandb_enabled=False,
         policy_metadata={"robot": "yam", "action_horizon": 50, "action_dim": 14, "adapt_to_pi": False},
+    ),
+    # Deployment-only mirrors of the dual fine-tunes' architecture and action
+    # representation. Each checkpoint supplies its own normalization assets.
+    TrainConfig(
+        name="yam_dual_task004_pi0_absolute",
+        model=pi0_config.Pi0Config(action_horizon=50, action_dim=32, max_token_len=48, dtype="bfloat16", pi05=False),
+        data=TpecYamDataConfig(
+            repo_id="yam/teleop", task="TASK-YAM-0004",
+            use_delta_joint_actions=False, quantile_norm_override=True,
+        ),
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="yam_dual_task004_pi05_relative",
+        model=pi0_config.Pi0Config(action_horizon=50, action_dim=32, max_token_len=96, dtype="bfloat16", pi05=True, discrete_state_input=True),
+        data=TpecYamDataConfig(
+            repo_id="yam/teleop", task="TASK-YAM-0004", quantile_norm_override=True,
+        ),
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="yam_dual_task006_pi0_relative",
+        model=pi0_config.Pi0Config(action_horizon=50, action_dim=32, max_token_len=48, dtype="bfloat16", pi05=False),
+        data=TpecYamDataConfig(
+            repo_id="yam/teleop", task="TASK-YAM-0006", quantile_norm_override=True,
+        ),
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="yam_dual_task006_pi05_relative",
+        model=pi0_config.Pi0Config(action_horizon=50, action_dim=32, max_token_len=96, dtype="bfloat16", pi05=True, discrete_state_input=True),
+        data=TpecYamDataConfig(
+            repo_id="yam/teleop", task="TASK-YAM-0006", quantile_norm_override=True,
+        ),
+        wandb_enabled=False,
     ),
     TrainConfig(
         name="pi0_base_aloha_full_sim_arx-x5_seed_0",

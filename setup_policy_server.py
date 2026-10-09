@@ -1,12 +1,13 @@
+import argparse
+import ast
 import asyncio
+import importlib
 import os
 import threading
-import ast
 import time
-import yaml
-import importlib
-import argparse
 import traceback
+
+import yaml
 from client_server.tcp.model_server import ModelServer
 
 
@@ -18,6 +19,9 @@ def eval_function_decorator(policy_model_name, Func_and_Class_name):
     """Load a specified function (e.g., get_model) from a policy module"""
     module = importlib.import_module(policy_model_name)
     return getattr(module, Func_and_Class_name)
+
+def _announce_ws_ready(url: str) -> None:
+    print(f"[INFO] policy server READY: {url} (model loaded; WebSocket listening)", flush=True)
 
 def main(deploy_cfg):
     """Main entry: load model, start server, run indefinitely"""
@@ -67,7 +71,7 @@ def main(deploy_cfg):
             ),
         )
         try:
-            asyncio.run(server.serve_forever())
+            asyncio.run(server.serve_forever(on_ready=_announce_ws_ready))
         except KeyboardInterrupt:
             print("\nShutting down websocket policy server...")
         return

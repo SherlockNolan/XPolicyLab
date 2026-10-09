@@ -9,20 +9,20 @@ import inspect
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
 import yaml
-from websockets.asyncio.server import Server, ServerConnection, serve
-from websockets.exceptions import ConnectionClosed
-
 from client_server.ws.protocol.codec import decode_envelope, decode_frame, encode_frame
 from client_server.ws.protocol.exceptions import ErrorCode, WsError
 from client_server.ws.protocol.keepalive import normalize_ws_ping
 from client_server.ws.protocol.messages import MessageType
 from client_server.ws.protocol.schemas import Frame
+from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+
 from XPolicyLab.utils.process_data import decode_obs_images
 
 logger = logging.getLogger(__name__)
@@ -134,10 +134,12 @@ class PolicyServer:
                     _SHUTDOWN_DRAIN_TIMEOUT_S,
                 )
 
-    async def serve_forever(self) -> None:
+    async def serve_forever(self, *, on_ready: Callable[[str], None] | None = None) -> None:
         await self.start()
         assert self._server is not None
         try:
+            if on_ready is not None:
+                on_ready(self.url)
             await self._server.serve_forever()
         finally:
             # Runs on cancellation too (e.g. Ctrl-C under asyncio.run), so
